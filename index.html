@@ -179,6 +179,7 @@ button{font:inherit;color:inherit;background:none;border:none;padding:0}
   display:flex;align-items:center;justify-content:center;font-family:var(--display);
   font-size:12px;font-weight:600;color:var(--char);box-shadow:0 4px 14px rgba(34,34,34,0.35);
   transition:background 0.35s ease,color 0.35s ease,width 0.35s ease,height 0.35s ease;width:34px;height:34px;
+  cursor:pointer;
 }
 .stop-dot.approaching{background:var(--lime);color:var(--char);width:40px;height:40px;animation:markerPulse 0.6s ease-in-out infinite}
 .stop-dot.active{background:var(--teal);color:var(--white);width:46px;height:46px}
@@ -193,6 +194,7 @@ button{font:inherit;color:inherit;background:none;border:none;padding:0}
 .sheet-idle{padding:22px 24px calc(var(--safe-b) + 34px)}
 .sheet-idle-title{font-family:var(--display);font-weight:600;font-size:15px;color:var(--char);margin-bottom:4px}
 .sheet-idle-sub{font-family:var(--body);font-size:13px;color:var(--ink-60)}
+.sheet-idle-hint{font-family:var(--body);font-size:13px;color:var(--teal);margin-top:10px}
 
 .sheet-stop{display:none;flex-direction:column;max-height:230px;overflow:hidden;transition:max-height 0.35s ease}
 .sheet-stop.expanded{max-height:78dvh}
@@ -307,6 +309,8 @@ button{font:inherit;color:inherit;background:none;border:none;padding:0}
         <div class="sheet-grab"></div>
         <div class="sheet-idle-title">Waiting for the next location…</div>
         <div class="sheet-idle-sub" id="sheetIdleSub">Walk toward a marker.</div>
+        <!-- NEW: hint for offsite visitors -->
+        <div class="sheet-idle-hint" id="sheetIdleHint">Not on site? Tap any numbered marker to listen.</div>
       </div>
 
       <div class="sheet-stop" id="sheetStop">
@@ -383,6 +387,10 @@ const HOW_IT_WORKS = [
 
 const EXIT_HYSTERESIS = 1.15;
 
+/* NEW: if the visitor is further than this from every stop, they're treated
+   as offsite for map framing (the map fits the stops, not the visitor). */
+const NEARBY_M = 5000;
+
 const $ = (id) => document.getElementById(id);
 $('cityNameHero').textContent = CITY_NAME;
 document.querySelectorAll('.cityName').forEach((el) => { el.textContent = CITY_NAME; });
@@ -399,6 +407,7 @@ const S = {
   stopLayers: {}, // id -> { marker, fade, core }
   activeStopId: null,
   dismissedStopId: null,
+  manualStopId: null, // NEW: stop opened by tapping from outside its zone
   expanded: false,
   audio: null,
   unlocked: false,
@@ -590,16 +599,23 @@ function onPosErr(err) {
 }
 
 /* ═══════════════ map ═══════════════ */
+/* CHANGED: an offsite visitor's position is left out of the initial framing,
+   so someone in another city sees the stops rather than a zoomed-out world map. */
+function userIsNearby() {
+  if (S.lat == null) return false;
+  return S.currentStops.some((m) => haversine(S.lat, S.lon, m.lat, m.lon) <= NEARBY_M);
+}
+
 function initMap() {
   if (!S.map) {
     S.map = L.map('map', { zoomControl: false, attributionControl: true, tap: true });
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-      maxZoom: 20, subdomains: 'abcd', attribution: '&copy; OpenStreetMap &copy; CARTO',
-    }).addTo(S.map);
+    L.tileLayer('https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png?key=cb1_47al_1_54d739e80a603c26169c0f16', {
+  maxZoom: 20, attribution: '&copy; OpenStreetMap &copy; CARTO',
+}).addTo(S.map);
   }
   drawStops();
   const pts = S.currentStops.map((m) => [m.lat, m.lon]);
-  if (S.lat != null) pts.push([S.lat, S.lon]);
+  if (userIsNearby()) pts.push([S.lat, S.lon]);
   if (pts.length === 1) S.map.setView(pts[0], 17);
   else if (pts.length > 1) S.map.fitBounds(L.latLngBounds(pts).pad(0.25));
   drawUser();
@@ -645,15 +661,22 @@ function drawUser() {
   }
 }
 
+/* CHANGED: tapping a marker always opens it.
+   - Inside the stop's zone → normal GPS mode (volume follows distance).
+   - Outside the zone, or no GPS at all → manual mode: full volume, and
+     geolocation won't swap or close it until the visitor closes the sheet. */
 function onStopMarkerClick(id) {
   const m = S.markersById[id];
   if (!m) return;
+  unlockAudio();
   const dist = S.lat != null ? haversine(S.lat, S.lon, m.lat, m.lon) : Infinity;
+  S.dismissedStopId = null;
   if (dist <= (m.fade_radius || 80)) {
-    S.dismissedStopId = null;
+    S.manualStopId = null;
     setActiveStop(id, dist);
   } else {
-    toast('Walk closer to reveal this stop');
+    S.manualStopId = id;
+    setActiveStop(id, null);
   }
 }
 
@@ -676,6 +699,16 @@ function zoneVolume(m, dist) {
   return volE;
 }
 
+/* NEW: repaint every marker from GPS state, with the manual stop shown as active. */
+function refreshMarkers() {
+  S.currentStops.forEach((m) => {
+    let state = 'idle';
+    if (S.lat != null) state = zoneState(m, haversine(S.lat, S.lon, m.lat, m.lon));
+    if (m.id === S.manualStopId) state = 'active';
+    paintStopMarker(m.id, state);
+  });
+}
+
 function checkZones() {
   if (S.lat == null || !S.currentStops.length) return;
   let nearest = null, nearestDist = Infinity;
@@ -685,11 +718,14 @@ function checkZones() {
     const dist = haversine(S.lat, S.lon, m.lat, m.lon);
     if (dist < nearestDist) { nearestDist = dist; nearest = m; }
     const state = zoneState(m, dist);
-    paintStopMarker(m.id, state);
+    paintStopMarker(m.id, m.id === S.manualStopId ? 'active' : state);
 
     if (m.id === S.dismissedStopId && state === 'idle') S.dismissedStopId = null; // left, can re-trigger later
     if (state !== 'idle' && dist < bestActiveDist) { bestActiveDist = dist; bestActive = m; }
   });
+
+  // NEW: a manually opened stop stays open until the visitor closes it
+  if (S.manualStopId) return;
 
   const suppressed = bestActive && bestActive.id === S.dismissedStopId;
 
@@ -725,6 +761,7 @@ function paintStopMarker(id, cls) {
 /* ═══════════════ sheet: idle ═══════════════ */
 function setSheetIdle() {
   S.activeStopId = null;
+  S.manualStopId = null;
   S.expanded = false;
   $('sheetStop').classList.remove('expanded');
   $('sheetStop').style.display = 'none';
@@ -756,18 +793,21 @@ function setActiveStop(id, dist) {
   $('sheetBody').textContent = m.description || '';
 
   bindAudio(m);
+  refreshMarkers();
   updateActiveVolume(m, dist ?? 0);
 }
 
 function clearActiveStop() {
   stopAudio();
   setSheetIdle();
+  refreshMarkers();
 }
 
 function updateActiveVolume(m, dist) {
-  paintStopMarker(m.id, zoneState(m, dist));
+  const manual = m.id === S.manualStopId;
+  paintStopMarker(m.id, manual ? 'active' : zoneState(m, dist));
   if (S.audio && S.audio.dataset.stopId === m.id) {
-    S.audio.volume = zoneVolume(m, dist);
+    S.audio.volume = manual ? 1 : zoneVolume(m, dist);
   }
 }
 
